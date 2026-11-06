@@ -63,7 +63,7 @@ async function handleProxy(token, request, env, ctx) {
 
   const secret = env.PROXY_SECRET;
   if (!secret || secret.length < 32) {
-    return text('PROXY_SECRET is not configured', 500);
+    return text('PROXY_SECRET is not configured. Run: npx wrangler secret put PROXY_SECRET', 500);
   }
 
   const payload = await verifyToken(token, secret);
