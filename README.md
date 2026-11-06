@@ -22,13 +22,17 @@ The PHP side enables it through `config.local.php`:
 ],
 ```
 
-## Deploy
+## Auto-deploy from GitHub
 
-```powershell
-npx wrangler login
-npx wrangler secret put PROXY_SECRET
-npm run deploy
-```
+This repo ships `.github/workflows/deploy.yml`. To make pushes deploy automatically:
+
+1. In GitHub: **Settings → Secrets and variables → Actions**, add:
+   - `CLOUDFLARE_API_TOKEN` (Workers Scripts:Edit + Account:Read)
+   - `CLOUDFLARE_ACCOUNT_ID`
+   - `PROXY_SECRET` (same value as in the PHP admin / config)
+2. Push to `main` — the workflow installs, syncs the secret, and deploys.
+3. Cloudflare prints the new `https://…workers.dev` URL in the run log. Paste it
+   into **Admin → Workers** (or `config.php`) on the PHP side.
 
 Put the printed `https://...workers.dev` URL into `worker_proxy.url` (in
 `config.php` on the production server) and keep the secrets in sync.
