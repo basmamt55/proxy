@@ -1,0 +1,5 @@
+# Copy to .dev.vars for `wrangler dev`.
+# This must match worker_proxy.secret in the PHP config.
+PROXY_SECRET=replace-with-a-long-random-string
+# Set to 1 only for local mock-origin testing. Never set in production.
+ALLOW_PRIVATE_HOSTS=0
