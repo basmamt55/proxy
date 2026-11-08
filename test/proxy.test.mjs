@@ -262,6 +262,10 @@ test('tokens produced by the PHP signer are accepted', async (t) => {
     }
 
     const tokenUrl = output.trim();
+    if (tokenUrl === 'SKIP') {
+      t.skip('PHP project is not available beside this repo');
+      return;
+    }
     assert.match(tokenUrl, /^http:\/\/proxy\.test\/p\//);
     const response = await call(new URL(tokenUrl).pathname, makeEnv(), makeContext());
     assert.equal(response.status, 200);

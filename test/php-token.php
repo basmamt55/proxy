@@ -14,8 +14,8 @@ if (!is_file($bootstrap)) {
     $bootstrap = '/home/divhard-ex/htdocs/ex.divhard.com/bootstrap.php';
 }
 if (!is_file($bootstrap)) {
-    fwrite(STDERR, "bootstrap.php was not found\n");
-    exit(1);
+    echo "SKIP\n";
+    exit(0);
 }
 require $bootstrap;
 putenv('WORKER_PROXY_CONFIG_ONLY=1');

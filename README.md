@@ -22,17 +22,11 @@ The PHP side enables it through `config.local.php`:
 ],
 ```
 
-## Auto-deploy from GitHub
+## GitHub
 
-This repo ships `.github/workflows/deploy.yml`. To make pushes deploy automatically:
-
-1. In GitHub: **Settings → Secrets and variables → Actions**, add:
-   - `CLOUDFLARE_API_TOKEN` (Workers Scripts:Edit + Account:Read)
-   - `CLOUDFLARE_ACCOUNT_ID`
-2. Push to `main`. The workflow deploys when the API token is present.
-   It does not create a `PROXY_SECRET` binding.
-3. Cloudflare prints the `https://…workers.dev` URL in the run log. Paste it
-   into **Admin → Workers** (or `config.php`) on the PHP side.
+Pushing `main` runs `npm test`. Cloudflare Workers Builds deploys this repo
+to the `proxy` script. Do not add a `PROXY_SECRET` binding. The playback
+token is unsigned.
 
 ## Playback
 
