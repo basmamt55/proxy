@@ -67,7 +67,21 @@ test('health endpoint', async () => {
   const ctx = makeContext();
   const response = await call('/health', makeEnv(), ctx);
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { ok: true, service: 'divhard-media-proxy', version: 2 });
+  assert.deepEqual(await response.json(), {
+    ok: true,
+    service: 'divhard-media-proxy',
+    version: 3,
+    ready: true,
+  });
+});
+
+test('health is not ready when the secret is missing', async () => {
+  const ctx = makeContext();
+  const response = await call('/health', makeEnv({ PROXY_SECRET: '' }), ctx);
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.ready, false);
+  assert.equal(body.version, 3);
 });
 
 test('rejects a bad signature and expired tokens', async () => {

@@ -11,7 +11,7 @@
  * Payload: { u: upstreamUrl, r: referer, k: "hls"|"file"|"text"|"img", e: exp }
  */
 
-const VERSION = 2;
+const VERSION = 3;
 const TOKEN_TTL = 86400;
 const PLAYLIST_CACHE_SECONDS = 5;
 const FILE_CACHE_SECONDS = 21600;
@@ -44,7 +44,8 @@ export default {
       }
 
       if (url.pathname === '/' || url.pathname === '/health') {
-        return json({ ok: true, service: 'divhard-media-proxy', version: VERSION });
+        const ready = Boolean(env && env.PROXY_SECRET && String(env.PROXY_SECRET).length >= 32);
+        return json({ ok: true, service: 'divhard-media-proxy', version: VERSION, ready });
       }
 
       if (url.pathname.startsWith('/p/')) {

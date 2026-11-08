@@ -40,10 +40,11 @@ Put the printed `https://...workers.dev` URL into `worker_proxy.url` (in
 ## Playback
 
 The admin Workers page on the player lists this Worker's `https://….workers.dev`
-address. An empty media-host list sends every host through the Worker, so file
-bytes come from Cloudflare instead of the origin. The player keeps an origin
-fallback. If a CDN rejects Cloudflare's address, that one play continues from
-`/api/media.php` on the origin.
+address. Checked media hosts are the only ones sent through the Worker. An
+empty media-host list sends every host. `/health` reports `ready` when
+`PROXY_SECRET` is bound. The player uses the Worker only while that flag is
+true, and keeps an origin fallback. If a CDN rejects Cloudflare's address,
+that one play continues from `/api/media.php` on the origin.
 
 The Worker follows redirects, sends the page Referer, and unwraps a PNG-wrapped
 MPEG-TS segment. It does not receive playback cookies. A host that only answers
