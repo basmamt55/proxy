@@ -1,22 +1,30 @@
 /**
  * DivHard media proxy — Cloudflare Worker.
  *
- * PHP signs a short-lived token. This Worker checks the HMAC, fetches the
- * upstream file with the player's Referer, rewrites HLS so every child URL
- * comes back through the Worker, and caches public files at the edge.
+ * PHP mints a short-lived token. This Worker fetches the upstream file with
+ * the player's Referer, rewrites HLS when the CDN allows Cloudflare, and
+ * asks the origin to pull a copy when Cloudflare is refused.
  *
  * Token format (URL-safe, no padding):
- *   base64url(JSON payload) + "." + base64url(HMAC-SHA256(secret, payload))
+ *   /p/{base64url(JSON payload)}
+ * A legacy "/p/{body}.{signature}" token is still accepted. The signature
+ * is ignored. There is no shared secret.
  *
- * Payload: { u: upstreamUrl, r: referer, k: "hls"|"file"|"text"|"img", e: exp }
+ * Payload: { u, r, k, e, f? }
+ *   u upstream URL
+ *   r page Referer
+ *   k "hls"|"file"|"text"|"img"
+ *   e expiry (unix seconds)
+ *   f origin /api/media.php URL used only after a Cloudflare refusal
  */
 
-const VERSION = 3;
+const VERSION = 4;
 const TOKEN_TTL = 86400;
 const PLAYLIST_CACHE_SECONDS = 5;
 const FILE_CACHE_SECONDS = 21600;
 const TEXT_CACHE_SECONDS = 600;
 const IMAGE_CACHE_SECONDS = 3600;
+const FILE_CACHE_MAX = 25 * 1024 * 1024;
 const MAX_REDIRECTS = 5;
 const finalUrls = new WeakMap();
 
@@ -44,8 +52,7 @@ export default {
       }
 
       if (url.pathname === '/' || url.pathname === '/health') {
-        const ready = Boolean(env && env.PROXY_SECRET && String(env.PROXY_SECRET).length >= 32);
-        return json({ ok: true, service: 'divhard-media-proxy', version: VERSION, ready });
+        return json({ ok: true, service: 'divhard-media-proxy', version: VERSION, ready: true });
       }
 
       if (url.pathname.startsWith('/p/')) {
@@ -65,12 +72,7 @@ async function handleProxy(token, request, env, ctx) {
     return text('Method not allowed', 405);
   }
 
-  const secret = env.PROXY_SECRET;
-  if (!secret || secret.length < 32) {
-    return text('PROXY_SECRET is not configured', 500);
-  }
-
-  const payload = await verifyToken(token, secret);
+  const payload = decodeToken(token);
   if (!payload) {
     return text('Invalid or expired media token', 403);
   }
@@ -90,6 +92,7 @@ async function handleProxy(token, request, env, ctx) {
 
   const kind = normaliseKind(payload.k, upstreamUrl.href);
   const referer = usefulReferer(payload.r);
+  const fill = safeFillUrl(payload.f, env);
   const range = request.headers.get('range');
   const sendRange = range && !isWrappedImagePath(upstreamUrl.pathname);
   const cache = caches.default;
@@ -101,6 +104,17 @@ async function handleProxy(token, request, env, ctx) {
     if (hit) {
       return withCors(hit);
     }
+  }
+
+  // PHP rewrites a playlist into child tokens that each carry their own fill
+  // URL. The Worker cannot mint those, so a playlist with `f` is read from
+  // the origin instead of being rewritten here.
+  if (kind === 'hls' && fill) {
+    const filled = await pipeFill(fill, request, kind, cache, cacheKey, ctx);
+    if (filled) {
+      return filled;
+    }
+    return text('Upstream fetch failed', 502);
   }
 
   let upstream;
@@ -119,10 +133,23 @@ async function handleProxy(token, request, env, ctx) {
     if (message === 'too-many-redirects') {
       return text('Too many redirects', 502);
     }
+    if (fill) {
+      const filled = await pipeFill(fill, request, kind, cache, cacheKey, ctx);
+      if (filled) {
+        return filled;
+      }
+    }
     return text('Upstream fetch failed', 502);
   }
 
   if (upstream.status !== 200 && upstream.status !== 206 && upstream.status !== 304) {
+    if ((upstream.status === 403 || upstream.status === 404) && fill) {
+      await discard(upstream);
+      const filled = await pipeFill(fill, request, kind, cache, cacheKey, ctx);
+      if (filled) {
+        return filled;
+      }
+    }
     const status = upstream.status >= 400 && upstream.status <= 599 ? upstream.status : 502;
     const failed = text('Upstream returned ' + upstream.status, status);
     failed.headers.set('x-upstream-status', String(upstream.status));
@@ -130,14 +157,70 @@ async function handleProxy(token, request, env, ctx) {
   }
 
   if (kind === 'hls') {
-    return await handlePlaylist(upstream, payload, request, env);
+    return await handlePlaylist(upstream, payload, request);
   }
 
   if (request.method !== 'HEAD' && shouldUnwrap(kind, upstream)) {
     upstream = await unwrapPngTs(upstream);
   }
 
-  return await handleFile(upstream, kind, cacheable, cache, cacheKey, ctx);
+  return await handleFile(upstream, kind, cacheable, cache, cacheKey, ctx, false);
+}
+
+async function pipeFill(fillUrl, request, kind, cache, cacheKey, ctx) {
+  const headers = new Headers();
+  headers.set('accept', '*/*');
+  headers.set('accept-encoding', 'identity');
+  headers.set('user-agent', USER_AGENT);
+  if (kind !== 'hls') {
+    const range = request.headers.get('range');
+    if (range && range.length <= 128) {
+      headers.set('range', range);
+    }
+  }
+
+  let response;
+  try {
+    response = await fetch(fillUrl, {
+      method: request.method === 'HEAD' ? 'HEAD' : 'GET',
+      headers,
+      redirect: 'manual',
+    });
+  } catch {
+    return null;
+  }
+
+  if (response.status !== 200 && response.status !== 206 && response.status !== 304) {
+    await discard(response);
+    return null;
+  }
+
+  if (kind === 'hls') {
+    const out = new Headers(CORS);
+    out.set(
+      'content-type',
+      response.headers.get('content-type') || 'application/vnd.apple.mpegurl; charset=utf-8'
+    );
+    out.set('cache-control', 'no-store');
+    out.set('x-proxy-kind', 'hls');
+    out.set('x-proxy-fill', '1');
+    return new Response(request.method === 'HEAD' ? null : response.body, {
+      status: response.status,
+      headers: out,
+    });
+  }
+
+  return handleFile(response, kind, true, cache, cacheKey, ctx, true);
+}
+
+async function discard(response) {
+  try {
+    if (response && response.body && typeof response.body.cancel === 'function') {
+      await response.body.cancel();
+    }
+  } catch {
+    /* the refused body is unused */
+  }
 }
 
 async function fetchUpstream(startUrl, options) {
@@ -203,7 +286,7 @@ async function handlePlaylist(upstream, payload, request, env) {
   }
 
   const base = settledUrl(upstream, payload.u);
-  const rewritten = await rewritePlaylist(body, base, payload, request.url, env.PROXY_SECRET);
+  const rewritten = await rewritePlaylist(body, base, payload, request.url);
 
   const headers = new Headers(CORS);
   headers.set('content-type', 'application/vnd.apple.mpegurl; charset=utf-8');
@@ -212,7 +295,7 @@ async function handlePlaylist(upstream, payload, request, env) {
   return new Response(rewritten, { status: 200, headers });
 }
 
-async function handleFile(upstream, kind, cacheable, cache, cacheKey, ctx) {
+async function handleFile(upstream, kind, cacheable, cache, cacheKey, ctx, filled) {
   const headers = new Headers(CORS);
   for (const name of [
     'content-type',
@@ -246,7 +329,11 @@ async function handleFile(upstream, kind, cacheable, cache, cacheKey, ctx) {
         : FILE_CACHE_SECONDS;
 
   headers.set('x-proxy-kind', kind);
-  headers.set('cache-control', cacheable ? `public, max-age=${ttl}` : 'no-store');
+  if (filled) {
+    headers.set('x-proxy-fill', '1');
+  }
+  const store = cacheable && canStore(upstream);
+  headers.set('cache-control', store ? `public, max-age=${ttl}` : 'no-store');
 
   const response = new Response(upstream.body, {
     status: upstream.status,
@@ -254,10 +341,20 @@ async function handleFile(upstream, kind, cacheable, cache, cacheKey, ctx) {
     headers,
   });
 
-  if (cacheable && upstream.status === 200) {
+  if (store) {
     ctx.waitUntil(cache.put(cacheKey, response.clone()));
   }
   return response;
+}
+
+function canStore(upstream) {
+  if (!upstream || upstream.status !== 200) return false;
+  const type = (upstream.headers.get('content-type') || '').toLowerCase();
+  if (type.includes('mpegurl') || type.includes('m3u8')) return false;
+  const length = upstream.headers.get('content-length') || '';
+  if (!/^\d+$/.test(length)) return false;
+  const size = Number(length);
+  return size > 0 && size <= FILE_CACHE_MAX;
 }
 
 function shouldUnwrap(kind, upstream) {
@@ -352,7 +449,7 @@ function isWrappedImagePath(pathname) {
   return String(pathname || '').toLowerCase().endsWith('.image');
 }
 
-async function rewritePlaylist(body, baseUrl, payload, requestUrl, secret) {
+async function rewritePlaylist(body, baseUrl, payload, requestUrl) {
   const origin = new URL(requestUrl).origin;
   const now = Math.floor(Date.now() / 1000);
   const parentExp = typeof payload.e === 'number' ? payload.e : now + TOKEN_TTL;
@@ -366,10 +463,12 @@ async function rewritePlaylist(body, baseUrl, payload, requestUrl, secret) {
       return reference;
     }
     const childKind = isPlaylistUrl(absolute) ? 'hls' : payload.k === 'text' ? 'text' : 'file';
-    const childToken = await signToken(
-      { u: absolute, r: payload.r || '', k: childKind, e: childExp },
-      secret
-    );
+    const childToken = encodeToken({
+      u: absolute,
+      r: payload.r || '',
+      k: childKind,
+      e: childExp,
+    });
     return origin + '/p/' + childToken;
   };
 
@@ -430,16 +529,13 @@ async function buildCacheKey(kind, url, referer) {
   return new Request('https://cache.divhard.internal/' + kind + '/' + hash, { method: 'GET' });
 }
 
-async function verifyToken(token, secret) {
-  const dot = token.lastIndexOf('.');
-  if (dot <= 0 || dot === token.length - 1) {
+function decodeToken(token) {
+  if (typeof token !== 'string' || token === '' || token.length > 12000) {
     return null;
   }
-
-  const body = token.slice(0, dot);
-  const signature = token.slice(dot + 1);
-  const expected = await hmacBase64(secret, body);
-  if (!timingSafeEqual(signature, expected)) {
+  const dot = token.indexOf('.');
+  const body = dot === -1 ? token : token.slice(0, dot);
+  if (body === '') {
     return null;
   }
 
@@ -456,25 +552,41 @@ async function verifyToken(token, secret) {
   if (typeof payload.e === 'number' && payload.e < Math.floor(Date.now() / 1000)) {
     return null;
   }
+  if (payload.f != null && typeof payload.f !== 'string') {
+    payload.f = '';
+  }
   return payload;
 }
 
-async function signToken(payload, secret) {
-  const body = base64UrlEncode(new TextEncoder().encode(JSON.stringify(payload)));
-  const signature = await hmacBase64(secret, body);
-  return body + '.' + signature;
+function encodeToken(payload) {
+  return base64UrlEncode(new TextEncoder().encode(JSON.stringify(payload)));
 }
 
-async function hmacBase64(secret, data) {
-  const key = await crypto.subtle.importKey(
-    'raw',
-    new TextEncoder().encode(secret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
-  const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
-  return base64UrlEncode(new Uint8Array(signature));
+function safeFillUrl(value, env) {
+  if (typeof value !== 'string' || value === '' || value.length > 4000) {
+    return '';
+  }
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return '';
+  }
+  if (url.username || url.password) {
+    return '';
+  }
+  if (url.pathname !== '/api/media.php') {
+    return '';
+  }
+  const host = url.hostname.toLowerCase();
+  if (host === 'ex.divhard.com' || host === 'www.ex.divhard.com') {
+    return url.protocol === 'https:' ? url.href : '';
+  }
+  const extra = env && env.FILL_HOST ? String(env.FILL_HOST).toLowerCase() : '';
+  if (extra && host === extra && (url.protocol === 'http:' || url.protocol === 'https:')) {
+    return url.href;
+  }
+  return '';
 }
 
 async function sha256Hex(value) {
@@ -501,17 +613,6 @@ function base64UrlDecode(value) {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes;
-}
-
-function timingSafeEqual(left, right) {
-  if (left.length !== right.length) {
-    return false;
-  }
-  let diff = 0;
-  for (let i = 0; i < left.length; i++) {
-    diff |= left.charCodeAt(i) ^ right.charCodeAt(i);
-  }
-  return diff === 0;
 }
 
 function isBlockedHost(hostname, env) {

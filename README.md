@@ -1,8 +1,9 @@
 # DivHard media proxy (Cloudflare Worker)
 
-Optional playback proxy. PHP signs short-lived tokens; the Worker verifies the
-HMAC, fetches the upstream media, rewrites HLS playlists so every child URL
-comes back through the Worker, and caches segments at the edge.
+Optional playback proxy. PHP mints a short-lived unsigned token. The Worker
+fetches the upstream media, rewrites HLS playlists when the CDN allows
+Cloudflare, and asks the origin to pull a copy when Cloudflare is refused.
+Complete files of 25MB or less are cached at the edge. Playlists are not.
 
 ## Local development
 
@@ -16,9 +17,8 @@ The PHP side enables it through `config.local.php`:
 
 ```php
 'worker_proxy' => [
-    'url'    => 'http://127.0.0.1:8787',
-    'secret' => '<same as PROXY_SECRET>',
-    'ttl'    => 86400,
+    'url' => 'http://127.0.0.1:8787',
+    'ttl' => 86400,
 ],
 ```
 
@@ -29,22 +29,19 @@ This repo ships `.github/workflows/deploy.yml`. To make pushes deploy automatica
 1. In GitHub: **Settings → Secrets and variables → Actions**, add:
    - `CLOUDFLARE_API_TOKEN` (Workers Scripts:Edit + Account:Read)
    - `CLOUDFLARE_ACCOUNT_ID`
-   - `PROXY_SECRET` (same value as in the PHP admin / config)
-2. Push to `main` — the workflow installs, syncs the secret, and deploys.
-3. Cloudflare prints the new `https://…workers.dev` URL in the run log. Paste it
+2. Push to `main`. The workflow deploys when the API token is present.
+   It does not create a `PROXY_SECRET` binding.
+3. Cloudflare prints the `https://…workers.dev` URL in the run log. Paste it
    into **Admin → Workers** (or `config.php`) on the PHP side.
-
-Put the printed `https://...workers.dev` URL into `worker_proxy.url` (in
-`config.php` on the production server) and keep the secrets in sync.
 
 ## Playback
 
 The admin Workers page on the player lists this Worker's `https://….workers.dev`
 address. Checked media hosts are the only ones sent through the Worker. An
-empty media-host list sends every host. `/health` reports `ready` when
-`PROXY_SECRET` is bound. The player uses the Worker only while that flag is
-true, and keeps an origin fallback. If a CDN rejects Cloudflare's address,
-that one play continues from `/api/media.php` on the origin.
+empty media-host list sends every host. `/health` reports `ready: true`
+without a shared secret. The player keeps an origin fallback. When a CDN
+returns 403 or 404, or the connection fails, the Worker streams the origin
+copy and the viewer still receives the bytes from Cloudflare.
 
 The Worker follows redirects, sends the page Referer, and unwraps a PNG-wrapped
 MPEG-TS segment. It does not receive playback cookies. A host that only answers

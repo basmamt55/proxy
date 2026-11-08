@@ -68,7 +68,10 @@ export async function startMockOrigin() {
     }
 
     if (url.pathname === '/v1/seg0.ts' || url.pathname === '/v1/seg1.ts') {
-      res.writeHead(200, { 'content-type': 'video/mp2t' });
+      res.writeHead(200, {
+        'content-type': 'video/mp2t',
+        'content-length': String(segment.length),
+      });
       res.end(segment);
       return;
     }
@@ -130,6 +133,40 @@ export async function startMockOrigin() {
     if (url.pathname === '/page.html') {
       res.writeHead(200, { 'content-type': 'text/html' });
       res.end('<!doctype html><title>not a playlist</title>');
+      return;
+    }
+
+    if (url.pathname === '/blocked.bin') {
+      res.writeHead(403, { 'content-type': 'text/plain', 'content-length': '2' });
+      res.end('no');
+      return;
+    }
+
+    if (url.pathname === '/missing.bin') {
+      res.writeHead(404, { 'content-type': 'text/plain', 'content-length': '4' });
+      res.end('gone');
+      return;
+    }
+
+    if (url.pathname === '/api/media.php') {
+      if (url.searchParams.get('k') === 'hls') {
+        const self = `http://${req.headers.host}`;
+        const body = `#EXTM3U\n${self}/file.bin\n`;
+        res.writeHead(200, {
+          'content-type': 'application/vnd.apple.mpegurl',
+          'content-length': String(Buffer.byteLength(body)),
+        });
+        res.end(body);
+        return;
+      }
+      const body = Buffer.alloc(16);
+      body.write('ftyp', 4, 'ascii');
+      res.writeHead(200, {
+        'content-type': 'video/mp4',
+        'content-length': String(body.length),
+        'accept-ranges': 'bytes',
+      });
+      res.end(body);
       return;
     }
 

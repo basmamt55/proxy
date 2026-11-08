@@ -63,6 +63,10 @@ async function call(path, env, ctx, init) {
   return response;
 }
 
+function encode(payload) {
+  return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+}
+
 test('health endpoint', async () => {
   const ctx = makeContext();
   const response = await call('/health', makeEnv(), ctx);
@@ -70,31 +74,49 @@ test('health endpoint', async () => {
   assert.deepEqual(await response.json(), {
     ok: true,
     service: 'divhard-media-proxy',
-    version: 3,
+    version: 4,
     ready: true,
   });
 });
 
-test('health is not ready when the secret is missing', async () => {
+test('health stays ready when no secret is configured', async () => {
   const ctx = makeContext();
   const response = await call('/health', makeEnv({ PROXY_SECRET: '' }), ctx);
   assert.equal(response.status, 200);
   const body = await response.json();
-  assert.equal(body.ready, false);
-  assert.equal(body.version, 3);
+  assert.equal(body.ready, true);
+  assert.equal(body.version, 4);
 });
 
-test('rejects a bad signature and expired tokens', async () => {
+test('rejects a broken or expired token and ignores a legacy signature', async () => {
   const ctx = makeContext();
   const env = makeEnv();
   const now = Math.floor(Date.now() / 1000);
 
-  const valid = sign({ u: 'https://example.com/x.m3u8', r: '', k: 'hls', e: now + 60 });
-  const tampered = valid.slice(0, -1) + (valid.endsWith('A') ? 'B' : 'A');
-  assert.equal((await call('/p/' + tampered, env, ctx)).status, 403);
+  assert.equal((await call('/p/not-a-token', env, ctx)).status, 403);
 
-  const expired = sign({ u: 'https://example.com/x.m3u8', r: '', k: 'hls', e: now - 10 });
+  const expired = encode({ u: 'https://example.com/x.m3u8', r: '', k: 'hls', e: now - 10 });
   assert.equal((await call('/p/' + expired, env, ctx)).status, 403);
+
+  const origin = await startMockOrigin();
+  try {
+    const payload = {
+      u: origin.baseUrl + '/file.bin',
+      r: 'https://embed.example/',
+      k: 'file',
+      e: now + 60,
+    };
+    const legacy = sign(payload);
+    const unsigned = encode(payload);
+    const legacyResponse = await call('/p/' + legacy, env, ctx);
+    assert.equal(legacyResponse.status, 200);
+    assert.equal((await legacyResponse.arrayBuffer()).byteLength, 1000);
+    const unsignedResponse = await call('/p/' + unsigned, env, makeContext());
+    assert.equal(unsignedResponse.status, 200);
+    assert.equal(unsignedResponse.headers.get('x-proxy-fill'), null);
+  } finally {
+    await origin.close();
+  }
 });
 
 test('blocks private hosts unless explicitly allowed', async () => {
@@ -281,6 +303,76 @@ test('blocks a redirect to a metadata address', async () => {
     const response = await call('/p/' + token, makeEnv(), makeContext());
     assert.equal(response.status, 403);
     assert.match(await response.text(), /Blocked upstream host/);
+  } finally {
+    await origin.close();
+  }
+});
+
+test('fills a refused file from the origin and does not follow a foreign fill host', async () => {
+  const origin = await startMockOrigin();
+  try {
+    const ctx = makeContext();
+    const now = Math.floor(Date.now() / 1000);
+    const env = makeEnv({ FILL_HOST: '127.0.0.1' });
+    const token = encode({
+      u: origin.baseUrl + '/blocked.bin',
+      r: 'https://embed.example/watch',
+      k: 'file',
+      e: now + 60,
+      f: origin.baseUrl + '/api/media.php?k=file',
+    });
+
+    const response = await call('/p/' + token, env, ctx);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('x-proxy-fill'), '1');
+    const body = new Uint8Array(await response.arrayBuffer());
+    assert.equal(body.length, 16);
+    assert.equal(Buffer.from(body.subarray(4, 8)).toString('ascii'), 'ftyp');
+    await ctx.flush();
+
+    const blockedBefore = origin.state.requests.filter((path) => path === '/blocked.bin').length;
+    const cached = await call('/p/' + token, env, ctx);
+    assert.equal(cached.status, 200);
+    assert.equal((await cached.arrayBuffer()).byteLength, 16);
+    const blockedAfter = origin.state.requests.filter((path) => path === '/blocked.bin').length;
+    assert.equal(blockedAfter, blockedBefore, 'second view came from the edge cache');
+
+    const foreign = encode({
+      u: origin.baseUrl + '/missing.bin',
+      r: 'https://embed.example/watch',
+      k: 'file',
+      e: now + 60,
+      f: 'https://evil.example/api/media.php?k=file',
+    });
+    const refused = await call('/p/' + foreign, env, makeContext());
+    assert.equal(refused.status, 404);
+    assert.match(await refused.text(), /Upstream returned 404/);
+  } finally {
+    await origin.close();
+  }
+});
+
+test('a playlist with an origin fill is returned as the origin wrote it', async () => {
+  const origin = await startMockOrigin();
+  try {
+    const token = encode({
+      u: origin.baseUrl + '/master.m3u8',
+      r: 'https://embed.example/watch',
+      k: 'hls',
+      e: Math.floor(Date.now() / 1000) + 60,
+      f: origin.baseUrl + '/api/media.php?k=hls',
+    });
+    const response = await call('/p/' + token, makeEnv({ FILL_HOST: '127.0.0.1' }), makeContext());
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('x-proxy-fill'), '1');
+    const body = await response.text();
+    assert.match(body, /^#EXTM3U/m);
+    assert.match(body, /\/file\.bin/);
+    assert.doesNotMatch(body, /\/p\//);
+    assert.equal(
+      origin.state.requests.some((path) => path.startsWith('/master.m3u8')),
+      false
+    );
   } finally {
     await origin.close();
   }

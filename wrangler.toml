@@ -4,9 +4,8 @@ compatibility_date = "2026-11-01"
 workers_dev = true
 account_id = "b1c54862e7c598b0fcc4979bb415ca2a"
 
-# Non-secret configuration. PROXY_SECRET is a Worker secret:
-#   printf '%s' "$PROXY_SECRET" | npx wrangler secret put PROXY_SECRET
-# Keep it the same value as the admin Workers page. Do not commit it.
+# Non-secret configuration. Playback tokens are unsigned.
+# Do not add a PROXY_SECRET binding. Do not put secrets in this file.
 
 [placement]
 mode = "smart"
