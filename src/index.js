@@ -1,11 +1,9 @@
 /**
  * DivHard media proxy — Cloudflare Worker.
  *
- * Only handles media traffic, not the studio/admin. PHP signs a short-lived
- * token containing the upstream URL, the Referer to send, and the media kind.
- * The Worker verifies the HMAC, fetches the upstream, rewrites HLS playlists
- * so every child URL comes back through the Worker, and caches segments at
- * the edge.
+ * PHP signs a short-lived token. This Worker checks the HMAC, fetches the
+ * upstream file with the player's Referer, rewrites HLS so every child URL
+ * comes back through the Worker, and caches public files at the edge.
  *
  * Token format (URL-safe, no padding):
  *   base64url(JSON payload) + "." + base64url(HMAC-SHA256(secret, payload))
@@ -13,15 +11,20 @@
  * Payload: { u: upstreamUrl, r: referer, k: "hls"|"file"|"text"|"img", e: exp }
  */
 
+const VERSION = 2;
 const TOKEN_TTL = 86400;
 const PLAYLIST_CACHE_SECONDS = 5;
 const FILE_CACHE_SECONDS = 21600;
 const TEXT_CACHE_SECONDS = 600;
 const IMAGE_CACHE_SECONDS = 3600;
+const MAX_REDIRECTS = 5;
+const finalUrls = new WeakMap();
 
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+const ACCEPT_LANGUAGE = 'en-US,en;q=0.9,ar;q=0.8';
 
 const CORS = {
   'access-control-allow-origin': '*',
@@ -41,11 +44,11 @@ export default {
       }
 
       if (url.pathname === '/' || url.pathname === '/health') {
-        return json({ ok: true, service: 'divhard-media-proxy' });
+        return json({ ok: true, service: 'divhard-media-proxy', version: VERSION });
       }
 
       if (url.pathname.startsWith('/p/')) {
-        const token = url.pathname.slice('/p/'.length);
+        const token = decodeURIComponent(url.pathname.slice('/p/'.length));
         return await handleProxy(token, request, env, ctx);
       }
 
@@ -63,7 +66,7 @@ async function handleProxy(token, request, env, ctx) {
 
   const secret = env.PROXY_SECRET;
   if (!secret || secret.length < 32) {
-    return text('PROXY_SECRET is not configured. Run: npx wrangler secret put PROXY_SECRET', 500);
+    return text('PROXY_SECRET is not configured', 500);
   }
 
   const payload = await verifyToken(token, secret);
@@ -80,13 +83,14 @@ async function handleProxy(token, request, env, ctx) {
   if (upstreamUrl.protocol !== 'http:' && upstreamUrl.protocol !== 'https:') {
     return text('Invalid upstream scheme', 400);
   }
-  if (env.ALLOW_PRIVATE_HOSTS !== '1' && isPrivateHostname(upstreamUrl.hostname)) {
+  if (isBlockedHost(upstreamUrl.hostname, env)) {
     return text('Blocked upstream host', 403);
   }
 
   const kind = normaliseKind(payload.k, upstreamUrl.href);
-  const referer = typeof payload.r === 'string' ? payload.r : '';
+  const referer = usefulReferer(payload.r);
   const range = request.headers.get('range');
+  const sendRange = range && !isWrappedImagePath(upstreamUrl.pathname);
   const cache = caches.default;
   const cacheKey = await buildCacheKey(kind, upstreamUrl.href, referer);
   const cacheable = !range && request.method === 'GET' && kind !== 'hls';
@@ -98,32 +102,23 @@ async function handleProxy(token, request, env, ctx) {
     }
   }
 
-  const headers = new Headers();
-  headers.set('accept', '*/*');
-  headers.set('accept-encoding', 'identity');
-  headers.set('user-agent', USER_AGENT);
-  if (referer) {
-    headers.set('referer', referer);
-    try {
-      headers.set('origin', new URL(referer).origin);
-    } catch {
-      /* ignore malformed referer */
-    }
-  }
-  if (range) {
-    headers.set('range', range);
-  }
-
   let upstream;
   try {
-    upstream = await fetch(upstreamUrl.href, {
+    upstream = await fetchUpstream(upstreamUrl, {
       method: request.method,
-      headers,
-      redirect: 'follow',
+      referer,
+      range: sendRange ? range : '',
+      env,
     });
   } catch (error) {
     const message = error && error.message ? error.message : String(error);
-    return text('Upstream fetch failed: ' + message, 502);
+    if (message === 'blocked-redirect') {
+      return text('Blocked upstream host', 403);
+    }
+    if (message === 'too-many-redirects') {
+      return text('Too many redirects', 502);
+    }
+    return text('Upstream fetch failed', 502);
   }
 
   if (upstream.status !== 200 && upstream.status !== 206 && upstream.status !== 304) {
@@ -137,7 +132,61 @@ async function handleProxy(token, request, env, ctx) {
     return await handlePlaylist(upstream, payload, request, env);
   }
 
+  if (request.method !== 'HEAD' && shouldUnwrap(kind, upstream)) {
+    upstream = await unwrapPngTs(upstream);
+  }
+
   return await handleFile(upstream, kind, cacheable, cache, cacheKey, ctx);
+}
+
+async function fetchUpstream(startUrl, options) {
+  let current = startUrl;
+  for (let hop = 0; hop < MAX_REDIRECTS; hop++) {
+    if (isBlockedHost(current.hostname, options.env)) {
+      throw new Error('blocked-redirect');
+    }
+    const headers = new Headers();
+    headers.set('accept', '*/*');
+    headers.set('accept-encoding', 'identity');
+    headers.set('accept-language', ACCEPT_LANGUAGE);
+    headers.set('user-agent', USER_AGENT);
+    if (options.referer) {
+      headers.set('referer', options.referer);
+      try {
+        headers.set('origin', new URL(options.referer).origin);
+      } catch {
+        /* referer was checked already */
+      }
+    }
+    if (options.range && !isWrappedImagePath(current.pathname)) {
+      headers.set('range', options.range);
+    }
+
+    const response = await fetch(current.href, {
+      method: options.method,
+      headers,
+      redirect: 'manual',
+    });
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      if (!location) {
+        return response;
+      }
+      current = new URL(location, current);
+      if (current.protocol !== 'http:' && current.protocol !== 'https:') {
+        throw new Error('blocked-redirect');
+      }
+      continue;
+    }
+    finalUrls.set(response, current.href);
+    return response;
+  }
+  throw new Error('too-many-redirects');
+}
+
+function settledUrl(upstream, fallback) {
+  return finalUrls.get(upstream) || upstream.url || fallback;
 }
 
 async function handlePlaylist(upstream, payload, request, env) {
@@ -152,20 +201,13 @@ async function handlePlaylist(upstream, payload, request, env) {
     );
   }
 
-  const rewritten = await rewritePlaylist(
-    body,
-    upstream.url || payload.u,
-    payload,
-    request.url,
-    env.PROXY_SECRET
-  );
+  const base = settledUrl(upstream, payload.u);
+  const rewritten = await rewritePlaylist(body, base, payload, request.url, env.PROXY_SECRET);
 
   const headers = new Headers(CORS);
   headers.set('content-type', 'application/vnd.apple.mpegurl; charset=utf-8');
   headers.set('cache-control', `public, max-age=${PLAYLIST_CACHE_SECONDS}`);
   headers.set('x-proxy-kind', 'hls');
-
-  // Playlists are small and can be live, so they are proxied but not stored.
   return new Response(rewritten, { status: 200, headers });
 }
 
@@ -215,6 +257,98 @@ async function handleFile(upstream, kind, cacheable, cache, cacheKey, ctx) {
     ctx.waitUntil(cache.put(cacheKey, response.clone()));
   }
   return response;
+}
+
+function shouldUnwrap(kind, upstream) {
+  if (kind !== 'file') return false;
+  let path = '';
+  try {
+    path = new URL(settledUrl(upstream, 'https://invalid/')).pathname;
+  } catch {
+    path = '';
+  }
+  const type = (upstream.headers.get('content-type') || '').toLowerCase();
+  return isWrappedImagePath(path) || type.startsWith('image/png');
+}
+
+async function unwrapPngTs(upstream) {
+  if (!upstream.body) return upstream;
+  const reader = upstream.body.getReader();
+  const chunks = [];
+  let held = new Uint8Array(0);
+  while (held.length < 512) {
+    const step = await reader.read();
+    if (step.done) break;
+    chunks.push(step.value);
+    held = concatBytes(held, step.value);
+  }
+  const skip = pngWrappedTsSkip(held);
+  if (skip < 1) {
+    const restored = prependStream(held, reader);
+    return new Response(restored, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers: upstream.headers,
+    });
+  }
+
+  const headers = new Headers(upstream.headers);
+  headers.set('content-type', 'video/mp2t');
+  headers.delete('content-range');
+  const length = upstream.headers.get('content-length');
+  if (length && /^\d+$/.test(length)) {
+    const next = Math.max(0, Number(length) - skip);
+    headers.set('content-length', String(next));
+  }
+  const rest = held.subarray(skip);
+  return new Response(prependStream(rest, reader), {
+    status: upstream.status === 206 ? 200 : upstream.status,
+    statusText: upstream.statusText,
+    headers,
+  });
+}
+
+function prependStream(prefix, reader) {
+  return new ReadableStream({
+    async start(controller) {
+      if (prefix.length) controller.enqueue(prefix);
+      try {
+        while (true) {
+          const step = await reader.read();
+          if (step.done) break;
+          controller.enqueue(step.value);
+        }
+        controller.close();
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+  });
+}
+
+function pngWrappedTsSkip(bytes) {
+  if (bytes.length < 259) return 0;
+  const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  for (let i = 0; i < sig.length; i++) {
+    if (bytes[i] !== sig[i]) return 0;
+  }
+  let iend = -1;
+  const limit = Math.min(bytes.length - 4, 240);
+  for (let i = 0; i <= limit; i++) {
+    if (bytes[i] === 0x49 && bytes[i + 1] === 0x45 && bytes[i + 2] === 0x4e && bytes[i + 3] === 0x44) {
+      iend = i;
+      break;
+    }
+  }
+  if (iend < 0) return 0;
+  const ts = iend + 8;
+  if (bytes.length <= ts + 188) return 0;
+  if (bytes[ts] !== 0x47 || bytes[ts + 188] !== 0x47) return 0;
+  return ts;
+}
+
+function isWrappedImagePath(pathname) {
+  return String(pathname || '').toLowerCase().endsWith('.image');
 }
 
 async function rewritePlaylist(body, baseUrl, payload, requestUrl, secret) {
@@ -280,6 +414,14 @@ function isPlaylistUrl(url) {
   } catch {
     return false;
   }
+}
+
+function usefulReferer(value) {
+  if (typeof value !== 'string') return '';
+  const referer = value.trim();
+  if (!/^https?:\/\/\S+$/i.test(referer)) return '';
+  if (referer.length > 2000) return '';
+  return referer;
 }
 
 async function buildCacheKey(kind, url, referer) {
@@ -371,6 +513,18 @@ function timingSafeEqual(left, right) {
   return diff === 0;
 }
 
+function isBlockedHost(hostname, env) {
+  if (isMetadataHostname(hostname)) return true;
+  if (env && env.ALLOW_PRIVATE_HOSTS === '1') return false;
+  return isPrivateHostname(hostname);
+}
+
+function isMetadataHostname(hostname) {
+  const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (host === 'metadata.google.internal' || host.endsWith('.metadata.google.internal')) return true;
+  return /^169\.254\./.test(host);
+}
+
 function isPrivateHostname(hostname) {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
 
@@ -408,6 +562,13 @@ function decodeEntities(value) {
     .replace(/&gt;/gi, '>')
     .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
     .replace(/&#([0-9]+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)));
+}
+
+function concatBytes(left, right) {
+  const out = new Uint8Array(left.length + right.length);
+  out.set(left, 0);
+  out.set(right, left.length);
+  return out;
 }
 
 function withCors(response) {

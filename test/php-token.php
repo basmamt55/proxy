@@ -6,7 +6,19 @@ declare(strict_types=1);
  * Usage: php worker/test/php-token.php <upstream-url>
  */
 
-require __DIR__ . '/../../bootstrap.php';
+$bootstrap = getenv('PHP_BOOTSTRAP') ?: '';
+if ($bootstrap === '' || !is_file($bootstrap)) {
+    $bootstrap = __DIR__ . '/../../bootstrap.php';
+}
+if (!is_file($bootstrap)) {
+    $bootstrap = '/home/divhard-ex/htdocs/ex.divhard.com/bootstrap.php';
+}
+if (!is_file($bootstrap)) {
+    fwrite(STDERR, "bootstrap.php was not found\n");
+    exit(1);
+}
+require $bootstrap;
+putenv('WORKER_PROXY_CONFIG_ONLY=1');
 
 $secret = (string)(getenv('PROXY_SECRET') ?: '');
 if (strlen($secret) < 32) {

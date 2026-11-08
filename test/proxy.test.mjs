@@ -67,7 +67,7 @@ test('health endpoint', async () => {
   const ctx = makeContext();
   const response = await call('/health', makeEnv(), ctx);
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { ok: true, service: 'divhard-media-proxy' });
+  assert.deepEqual(await response.json(), { ok: true, service: 'divhard-media-proxy', version: 2 });
 });
 
 test('rejects a bad signature and expired tokens', async () => {
@@ -230,6 +230,67 @@ test('tokens produced by the PHP signer are accepted', async (t) => {
     const response = await call(new URL(tokenUrl).pathname, makeEnv(), makeContext());
     assert.equal(response.status, 200);
     assert.match(await response.text(), /^#EXTM3U/m);
+  } finally {
+    await origin.close();
+  }
+});
+
+test('follows a redirect and keeps the referer and language', async () => {
+  const origin = await startMockOrigin();
+  try {
+    const token = sign({
+      u: origin.baseUrl + '/bounce',
+      r: 'https://embed.example/watch',
+      k: 'file',
+      e: Math.floor(Date.now() / 1000) + 60,
+    });
+    const response = await call('/p/' + token, makeEnv(), makeContext());
+    assert.equal(response.status, 200);
+    assert.equal((await response.arrayBuffer()).byteLength, 1000);
+    assert.equal(origin.state.lastReferer, 'https://embed.example/watch');
+    assert.match(origin.state.lastLanguage, /en-US/);
+    assert.ok(origin.state.requests.includes('/file.bin'));
+  } finally {
+    await origin.close();
+  }
+});
+
+test('blocks a redirect to a metadata address', async () => {
+  const origin = await startMockOrigin();
+  try {
+    const token = sign({
+      u: origin.baseUrl + '/to-metadata',
+      r: 'https://embed.example/watch',
+      k: 'file',
+      e: Math.floor(Date.now() / 1000) + 60,
+    });
+    const response = await call('/p/' + token, makeEnv(), makeContext());
+    assert.equal(response.status, 403);
+    assert.match(await response.text(), /Blocked upstream host/);
+  } finally {
+    await origin.close();
+  }
+});
+
+test('unwraps a png-wrapped transport stream and ignores a range on that path', async () => {
+  const origin = await startMockOrigin();
+  try {
+    const token = sign({
+      u: origin.baseUrl + '/seg.image',
+      r: 'not a referer',
+      k: 'file',
+      e: Math.floor(Date.now() / 1000) + 60,
+    });
+    const response = await call('/p/' + token, makeEnv(), makeContext(), {
+      headers: { range: 'bytes=0-10' },
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-type'), 'video/mp2t');
+    const body = new Uint8Array(await response.arrayBuffer());
+    assert.equal(body[0], 0x47);
+    assert.equal(body[188], 0x47);
+    assert.equal(origin.state.lastRange, '');
+    assert.equal(origin.state.lastReferer, '');
   } finally {
     await origin.close();
   }

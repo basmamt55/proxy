@@ -1,15 +1,15 @@
-name = "divhard-media-proxy"
+name = "proxy"
 main = "src/index.js"
 compatibility_date = "2026-11-01"
 workers_dev = true
+account_id = "b1c54862e7c598b0fcc4979bb415ca2a"
 
-# Non-secret configuration. Secrets (PROXY_SECRET) are set with:
-#   npx wrangler secret put PROXY_SECRET
-# or via the Cloudflare dashboard / GitHub Actions secrets.
+# Non-secret configuration. PROXY_SECRET is a Worker secret:
+#   printf '%s' "$PROXY_SECRET" | npx wrangler secret put PROXY_SECRET
+# Keep it the same value as the admin Workers page. Do not commit it.
+
+[placement]
+mode = "smart"
 
 [observability]
 enabled = true
-
-# Optional: bind a custom domain in the dashboard instead of workers.dev.
-# [env.production]
-# routes = [{ pattern = "proxy.example.com/*", zone_name = "example.com" }]

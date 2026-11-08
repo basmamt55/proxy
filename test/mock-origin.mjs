@@ -12,12 +12,16 @@ export async function startMockOrigin() {
   const state = {
     requests: [],
     lastReferer: '',
+    lastLanguage: '',
+    lastRange: '',
   };
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     state.requests.push(url.pathname + url.search);
     state.lastReferer = req.headers.referer || '';
+    state.lastLanguage = req.headers['accept-language'] || '';
+    state.lastRange = req.headers.range || '';
 
     const referer = req.headers.referer || '';
     const key = Buffer.from('0123456789abcdef', 'utf8');
@@ -93,6 +97,33 @@ export async function startMockOrigin() {
         'accept-ranges': 'bytes',
       });
       res.end(file);
+      return;
+    }
+
+    if (url.pathname === '/bounce') {
+      res.writeHead(302, { location: '/file.bin' });
+      res.end();
+      return;
+    }
+
+    if (url.pathname === '/to-metadata') {
+      res.writeHead(302, { location: 'http://169.254.169.254/latest/meta-data' });
+      res.end();
+      return;
+    }
+
+    if (url.pathname === '/seg.image') {
+      const png = Buffer.from([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+        0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0x00, 0x00, 0x00, 0x00,
+      ]);
+      const ts = Buffer.alloc(188 * 2, 0x47);
+      const body = Buffer.concat([png, ts]);
+      res.writeHead(200, {
+        'content-type': 'image/png',
+        'content-length': String(body.length),
+      });
+      res.end(body);
       return;
     }
 

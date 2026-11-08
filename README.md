@@ -37,21 +37,22 @@ This repo ships `.github/workflows/deploy.yml`. To make pushes deploy automatica
 Put the printed `https://...workers.dev` URL into `worker_proxy.url` (in
 `config.php` on the production server) and keep the secrets in sync.
 
-## Important limitation
+## Playback
 
-The providers used by this app (cdn-video.xyz and similar) bind their media
-tokens to the requesting IP. A Worker running on Cloudflare's edge fetches
-with Cloudflare's egress IP and receives `403` from those CDNs. The Worker is
-therefore useful for:
+The admin Workers page on the player lists this Worker's `https://….workers.dev`
+address. An empty media-host list sends every host through the Worker, so file
+bytes come from Cloudflare instead of the origin. The player keeps an origin
+fallback. If a CDN rejects Cloudflare's address, that one play continues from
+`/api/media.php` on the origin.
 
-- local development (workerd uses the developer's own IP), and
-- public streams that do not IP-bind (tests use test-streams.mux.dev).
+The Worker follows redirects, sends the page Referer, and unwraps a PNG-wrapped
+MPEG-TS segment. It does not receive playback cookies. A host that only answers
+with an origin cookie still plays through the fallback.
 
-For production with these providers, leave `worker_proxy.url` empty so the PHP
-proxy at `/api/media.php` runs on the origin and fetches with the origin IP.
-`Remote::request()` falls back to PHP's native stream wrapper when cURL cannot
-complete the TLS handshake, which is what makes local playback work even
-without the Worker.
+## Local mock
+
+Tests use a mock origin. `ALLOW_PRIVATE_HOSTS=1` is for that mock only. Do not
+set it on the deployed Worker.
 
 ## Files
 
