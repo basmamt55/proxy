@@ -25,8 +25,9 @@ The PHP side enables it through `config.local.php`:
 ## GitHub
 
 Pushing `main` runs `npm test`. Cloudflare Workers Builds deploys this repo
-to the `proxy` script. Do not add a `PROXY_SECRET` binding. The playback
-token is unsigned.
+to the `proxy` script on the account that owns that build. `wrangler.toml`
+does not pin an account id, so each account publishes its own Worker.
+Do not add a `PROXY_SECRET` binding. The playback token is unsigned.
 
 ## Playback
 

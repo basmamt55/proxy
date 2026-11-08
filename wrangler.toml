@@ -2,9 +2,9 @@ name = "proxy"
 main = "src/index.js"
 compatibility_date = "2026-11-01"
 workers_dev = true
-account_id = "b1c54862e7c598b0fcc4979bb415ca2a"
 
-# Non-secret configuration. Playback tokens are unsigned.
+# No account_id. Workers Builds sets CLOUDFLARE_ACCOUNT_ID to the account
+# that owns the build. A pinned id would send every account at the first one.
 # Do not add a PROXY_SECRET binding. Do not put secrets in this file.
 
 [placement]
